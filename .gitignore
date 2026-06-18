@@ -1,0 +1,45 @@
+# Build outputs
+/bin/
+/client/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.a
+*.o
+*.obj
+
+# Logs and runtime artifacts
+*.log
+*.log.*
+*.pid
+*.pid.lock
+*.out
+*.err
+*.stackdump
+
+# Local configuration and secrets
+config.json
+config.*.json
+!config.example.json
+*.local.json
+*.env
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+*.csr
+*.tgz
+*.bat
+
+# Editor / OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
