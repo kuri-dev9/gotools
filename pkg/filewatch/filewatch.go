@@ -1,7 +1,6 @@
 package filewatch
 
 import (
-	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -23,12 +22,13 @@ type Options struct {
 }
 
 type Report struct {
-	ConfDir string
-	Configs []ConfigReport
+	ConfDir     string
+	ProjectHome string
+	Configs     []ConfigReport
 }
 
 type ConfigReport struct {
-	Name    string
+	Path    string
 	Entries []WatchEntry
 	Error   string
 }
@@ -54,7 +54,8 @@ type patternSpec struct {
 }
 
 type compiledPattern struct {
-	dir      string
+	baseDir  string
+	dirExpr  *regexp.Regexp
 	fileExpr *regexp.Regexp
 	timeExpr *regexp.Regexp
 }
@@ -83,9 +84,13 @@ func Run(opts Options) (*Report, error) {
 		return nil, fmt.Errorf("no .ini or .json files in %s", confDir)
 	}
 
-	report := &Report{ConfDir: confDir}
+	report := &Report{ConfDir: confDir, ProjectHome: projectHomeFromConfDir(confDir)}
 	for _, file := range files {
-		cfg := ConfigReport{Name: filepath.Base(file)}
+		absFile, err := filepath.Abs(file)
+		if err != nil {
+			absFile = file
+		}
+		cfg := ConfigReport{Path: absFile}
 		specs, err := ParseConfig(file)
 		if err != nil {
 			cfg.Error = err.Error()
@@ -104,7 +109,7 @@ func Run(opts Options) (*Report, error) {
 					continue
 				}
 
-				entry.Dir = cp.dir
+				entry.Dir = cp.baseDir
 				entry.Files, entry.Error = scanFiles(cp, opts)
 				cfg.Entries = append(cfg.Entries, entry)
 			}
@@ -168,6 +173,15 @@ func parseINIFile(path string) ([]patternSpec, error) {
 		return nil, err
 	}
 
+	actionTargets := actionWriteTargets(ini)
+	if len(actionTargets) > 0 {
+		var specs []patternSpec
+		for _, target := range actionTargets {
+			specs = appendActionSection(specs, getSection(ini, target))
+		}
+		return specs, nil
+	}
+
 	var specs []patternSpec
 	for section, values := range ini {
 		lowerSection := strings.ToLower(section)
@@ -198,6 +212,14 @@ func parseINIFile(path string) ([]patternSpec, error) {
 	return specs, nil
 }
 
+func actionWriteTargets(ini map[string]map[string]string) []string {
+	action := getSection(ini, "ACTION")
+	if len(action) == 0 {
+		return nil
+	}
+	return splitList(getValue(action, "write"))
+}
+
 func appendActionSection(specs []patternSpec, values map[string]string) []patternSpec {
 	if len(values) == 0 {
 		return specs
@@ -218,32 +240,67 @@ func parseJSONFile(path string) ([]patternSpec, error) {
 	if err != nil {
 		return nil, err
 	}
-	var root map[string]interface{}
-	if err := json.Unmarshal(b, &root); err != nil {
-		return nil, err
-	}
+	projectHome := projectHomeFromConfigPath(path)
+	return parseLooseJSONText(stripQueryBlocks(string(b)), projectHome), nil
+}
 
+func stripQueryBlocks(s string) string {
+	lines := strings.Split(s, "\n")
+	var out []string
+	skipQuery := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if skipQuery {
+			if trimmed == `"` || trimmed == `",` || strings.HasSuffix(trimmed, `",`) {
+				skipQuery = false
+			}
+			continue
+		}
+		if isJSONKeyLine(trimmed, "query") {
+			if strings.Count(trimmed, `"`) < 4 {
+				skipQuery = true
+			}
+			continue
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+func parseLooseJSONText(s, projectHome string) []patternSpec {
 	var specs []patternSpec
-	for jobName, raw := range root {
-		if strings.HasPrefix(jobName, "--") {
+	for _, job := range findNamedObjectBlocks(s, "") {
+		name := strings.TrimSpace(job.name)
+		if strings.HasPrefix(name, "--") {
 			continue
 		}
-		job, ok := raw.(map[string]interface{})
-		if !ok {
+		inputBlock := findFirstNamedBlock(job.body, "INPUT")
+		outputBlock := findFirstNamedBlock(job.body, "OUTPUT")
+		if outputBlock == "" || !blockStringEquals(outputBlock, "type", "FILE") {
 			continue
 		}
-		output, ok := job["OUTPUT"].(map[string]interface{})
-		if !ok {
+		paths := extractStringValue(outputBlock, "paths")
+		if paths == "" {
 			continue
 		}
-		if !equalsString(output["type"], "FILE") {
-			continue
-		}
-		if paths, ok := output["paths"].(string); ok {
-			specs = appendSplit(specs, "OUT", paths)
+		vars := defaultVariables(projectHome)
+		mergeVariables(vars, extractVariables(inputBlock))
+		mergeVariables(vars, extractVariables(outputBlock))
+		specs = appendSplit(specs, "OUT", substituteVariables(paths, vars))
+	}
+	if len(specs) == 0 {
+		outputBlock := findFirstNamedBlock(s, "OUTPUT")
+		if outputBlock != "" && blockStringEquals(outputBlock, "type", "FILE") {
+			paths := extractStringValue(outputBlock, "paths")
+			if paths != "" {
+				vars := defaultVariables(projectHome)
+				mergeVariables(vars, extractVariables(findFirstNamedBlock(s, "INPUT")))
+				mergeVariables(vars, extractVariables(outputBlock))
+				specs = appendSplit(specs, "OUT", substituteVariables(paths, vars))
+			}
 		}
 	}
-	return specs, nil
+	return specs
 }
 
 func readINI(path string) (map[string]map[string]string, error) {
@@ -297,6 +354,100 @@ func getValue(values map[string]string, key string) string {
 	return ""
 }
 
+func getJSONMap(parent map[string]interface{}, key string) map[string]interface{} {
+	for k, v := range parent {
+		if strings.HasPrefix(k, "--") {
+			continue
+		}
+		if strings.EqualFold(k, key) {
+			m, _ := v.(map[string]interface{})
+			return m
+		}
+	}
+	return nil
+}
+
+func getJSONString(parent map[string]interface{}, key string) string {
+	for k, v := range parent {
+		if strings.HasPrefix(k, "--") {
+			continue
+		}
+		if strings.EqualFold(k, key) {
+			s, _ := v.(string)
+			return s
+		}
+	}
+	return ""
+}
+
+func getJSONVariables(parent map[string]interface{}) map[string]string {
+	vars := make(map[string]string)
+	varBlock := getJSONMap(parent, "variable")
+	for k, v := range varBlock {
+		if strings.HasPrefix(k, "--") {
+			continue
+		}
+		if s, ok := v.(string); ok {
+			vars[k] = s
+		}
+	}
+	return vars
+}
+
+func defaultVariables(projectHome string) map[string]string {
+	return map[string]string{
+		"LOADER_DIR": projectHome,
+		"SCRIPT_DIR": projectHome,
+	}
+}
+
+func mergeVariables(dst, src map[string]string) {
+	for k, v := range src {
+		if strings.HasPrefix(k, "--") {
+			continue
+		}
+		dst[k] = v
+	}
+}
+
+func substituteVariables(s string, vars map[string]string) string {
+	re := regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+	return re.ReplaceAllStringFunc(s, func(match string) string {
+		key := match[2 : len(match)-1]
+		if value, ok := vars[key]; ok {
+			if isDateVariable(key) && isRuntimeArgValue(value) {
+				return match
+			}
+			return value
+		}
+		return match
+	})
+}
+
+func isDateVariable(key string) bool {
+	switch strings.ToUpper(key) {
+	case "DT", "HM", "YMD", "YMDH", "YMDHM":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRuntimeArgValue(value string) bool {
+	return regexp.MustCompile(`^\$\{ARGV\[[0-9]+\]\}$`).MatchString(strings.TrimSpace(value))
+}
+
+func projectHomeFromConfigPath(path string) string {
+	return projectHomeFromConfDir(filepath.Dir(path))
+}
+
+func projectHomeFromConfDir(confDir string) string {
+	if strings.EqualFold(filepath.Base(confDir), "conf") {
+		return filepath.Dir(confDir)
+	}
+	return confDir
+}
+
 func stripInlineComment(s string) string {
 	inQuote := false
 	for i, r := range s {
@@ -310,6 +461,113 @@ func stripInlineComment(s string) string {
 		}
 	}
 	return strings.Trim(strings.TrimSpace(s), `"'`)
+}
+
+func leadingSpace(s string) string {
+	return s[:len(s)-len(strings.TrimLeft(s, " \t"))]
+}
+
+func isJSONKeyLine(line, key string) bool {
+	re := regexp.MustCompile(`^"` + regexp.QuoteMeta(key) + `"\s*:`)
+	return re.MatchString(line)
+}
+
+type namedBlock struct {
+	name string
+	body string
+}
+
+func findNamedObjectBlocks(s, parentKey string) []namedBlock {
+	var blocks []namedBlock
+	re := regexp.MustCompile(`"([^"]+)"\s*:\s*\{`)
+	matches := re.FindAllStringSubmatchIndex(s, -1)
+	for _, match := range matches {
+		name := s[match[2]:match[3]]
+		if parentKey != "" && !strings.EqualFold(name, parentKey) {
+			continue
+		}
+		bodyStart := match[1] - 1
+		bodyEnd := findMatchingBrace(s, bodyStart)
+		if bodyEnd < 0 {
+			continue
+		}
+		blocks = append(blocks, namedBlock{name: name, body: s[bodyStart : bodyEnd+1]})
+	}
+	return blocks
+}
+
+func findFirstNamedBlock(s, key string) string {
+	blocks := findNamedObjectBlocks(s, key)
+	if len(blocks) == 0 {
+		return ""
+	}
+	return blocks[0].body
+}
+
+func findMatchingBrace(s string, start int) int {
+	depth := 0
+	inString := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if inString {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == '"' {
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func blockStringEquals(block, key, want string) bool {
+	return strings.EqualFold(extractStringValue(block, key), want)
+}
+
+func extractStringValue(block, key string) string {
+	re := regexp.MustCompile(`"` + regexp.QuoteMeta(key) + `"\s*:\s*"([^"]*)"`)
+	matches := re.FindAllStringSubmatch(block, -1)
+	for _, match := range matches {
+		if len(match) == 2 {
+			return match[1]
+		}
+	}
+	return ""
+}
+
+func extractVariables(block string) map[string]string {
+	vars := make(map[string]string)
+	varBlock := findFirstNamedBlock(block, "variable")
+	if varBlock == "" {
+		return vars
+	}
+	re := regexp.MustCompile(`"([^"]+)"\s*:\s*"([^"]*)"`)
+	for _, match := range re.FindAllStringSubmatch(varBlock, -1) {
+		if len(match) != 3 || strings.HasPrefix(match[1], "--") {
+			continue
+		}
+		vars[match[1]] = match[2]
+	}
+	return vars
 }
 
 func appendSplit(specs []patternSpec, label, value string) []patternSpec {
@@ -331,34 +589,28 @@ func splitList(value string) []string {
 }
 
 func scanFiles(cp compiledPattern, opts Options) ([]FileEntry, string) {
-	entries, err := ioutil.ReadDir(cp.dir)
-	if err != nil {
-		return nil, err.Error()
-	}
-
 	var files []FileEntry
-	for _, entry := range entries {
-		if entry.IsDir() || ignored(entry.Name(), opts.Ignore) {
-			continue
+	if cp.dirExpr == nil {
+		if err := scanFilesInDir(cp.baseDir, "", cp, opts, &files); err != nil {
+			return nil, err.Error()
 		}
-		if !cp.fileExpr.MatchString(entry.Name()) {
-			continue
+	} else {
+		dirs, err := ioutil.ReadDir(cp.baseDir)
+		if err != nil {
+			return nil, err.Error()
 		}
-		tm, ok := extractTime(cp, entry.Name())
-		if !ok {
-			continue
+		for _, dir := range dirs {
+			if !dir.IsDir() {
+				continue
+			}
+			relDir := dir.Name()
+			if !cp.dirExpr.MatchString(filepath.ToSlash(relDir)) {
+				continue
+			}
+			_ = scanFilesInDir(filepath.Join(cp.baseDir, relDir), relDir, cp, opts, &files)
 		}
-		files = append(files, FileEntry{
-			Name: entry.Name(),
-			Time: tm,
-			Size: entry.Size(),
-			Warn: opts.Now.Sub(tm) >= time.Duration(opts.Warn)*time.Minute,
-		})
 	}
-
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].Time.After(files[j].Time)
-	})
+	sort.Slice(files, func(i, j int) bool { return files[i].Time.After(files[j].Time) })
 	if len(files) == 0 {
 		return nil, "no matching files"
 	}
@@ -368,17 +620,46 @@ func scanFiles(cp compiledPattern, opts Options) ([]FileEntry, string) {
 	return files, ""
 }
 
+func scanFilesInDir(absDir, relDir string, cp compiledPattern, opts Options, files *[]FileEntry) error {
+	entries, err := ioutil.ReadDir(absDir)
+	if err != nil {
+		return err
+	}
+	for _, f := range entries {
+		if f.IsDir() || ignored(f.Name(), opts.Ignore) || !cp.fileExpr.MatchString(f.Name()) {
+			continue
+		}
+		tm, ok := extractTime(cp, f.Name())
+		if !ok {
+			continue
+		}
+		name := f.Name()
+		if relDir != "" {
+			name = filepath.Join(relDir, f.Name())
+		}
+		*files = append(*files, FileEntry{Name: name, Time: tm, Size: f.Size(), Warn: opts.Now.Sub(tm) >= time.Duration(opts.Warn)*time.Minute})
+	}
+	return nil
+}
+
 func compilePattern(full string) (compiledPattern, error) {
-	dir, file := splitPathPattern(full)
-	if dir == "" || file == "" {
+	baseDir, dirPattern, filePattern := splitPathPattern(full)
+	if baseDir == "" || filePattern == "" {
 		return compiledPattern{}, fmt.Errorf("invalid pattern: %s", full)
 	}
-
-	fileExpr, timeExpr, err := makeRegex(file)
+	var dirExpr *regexp.Regexp
+	var err error
+	if dirPattern != "" {
+		dirExpr, _, err = makeRegex(filepath.ToSlash(dirPattern))
+		if err != nil {
+			return compiledPattern{}, err
+		}
+	}
+	fileExpr, timeExpr, err := makeRegex(filePattern)
 	if err != nil {
 		return compiledPattern{}, err
 	}
-	return compiledPattern{dir: dir, fileExpr: fileExpr, timeExpr: timeExpr}, nil
+	return compiledPattern{baseDir: baseDir, dirExpr: dirExpr, fileExpr: fileExpr, timeExpr: timeExpr}, nil
 }
 
 func makeRegex(pattern string) (*regexp.Regexp, *regexp.Regexp, error) {
@@ -387,8 +668,9 @@ func makeRegex(pattern string) (*regexp.Regexp, *regexp.Regexp, error) {
 	for _, token := range tokens {
 		expr = strings.ReplaceAll(expr, regexp.QuoteMeta(token), tokenRegex(token))
 	}
+	expr = replaceDateVariableTokens(pattern, expr)
 
-	if !strings.Contains(pattern, "%Y") || !strings.Contains(pattern, "%m") || !strings.Contains(pattern, "%d") {
+	if !hasDateToken(pattern) {
 		return nil, nil, fmt.Errorf("pattern has no supported date token")
 	}
 
@@ -403,7 +685,7 @@ func makeRegex(pattern string) (*regexp.Regexp, *regexp.Regexp, error) {
 	}
 	fullExpr += "$"
 
-	timeExpr, err := regexp.Compile(`\d{8}_\d{4}|\d{12}|\d{8}_\d{2}|\d{10}`)
+	timeExpr, err := regexp.Compile(`\d{8}_\d{4}|\d{8}_\d{2}|\d{12}|\d{10}|\d{8}`)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -412,6 +694,34 @@ func makeRegex(pattern string) (*regexp.Regexp, *regexp.Regexp, error) {
 		return nil, nil, err
 	}
 	return fileExpr, timeExpr, nil
+}
+
+func hasDateToken(pattern string) bool {
+	if strings.Contains(pattern, "%Y") && strings.Contains(pattern, "%m") && strings.Contains(pattern, "%d") {
+		return true
+	}
+	return dateVariablePattern().MatchString(pattern)
+}
+
+func replaceDateVariableTokens(pattern, expr string) string {
+	for _, token := range dateVariablePattern().FindAllString(pattern, -1) {
+		expr = strings.ReplaceAll(expr, regexp.QuoteMeta(token), dateVariableRegex(token))
+	}
+	return expr
+}
+
+func dateVariablePattern() *regexp.Regexp {
+	return regexp.MustCompile(`\$\{(?:DT|HM|YMD|YMDH|YMDHM|ARGV\[[0-9]+\])\}`)
+}
+
+func dateVariableRegex(token string) string {
+	name := strings.TrimSuffix(strings.TrimPrefix(token, `${`), `}`)
+	switch strings.ToUpper(name) {
+	case "HM":
+		return `(\d{2,4})`
+	default:
+		return `(\d{8,12})`
+	}
 }
 
 func tokenRegex(token string) string {
@@ -424,6 +734,9 @@ func tokenRegex(token string) string {
 }
 
 func extractTime(cp compiledPattern, name string) (time.Time, bool) {
+	if cp.timeExpr == nil {
+		return time.Time{}, false
+	}
 	m := cp.timeExpr.FindString(name)
 	if m == "" {
 		return time.Time{}, false
@@ -433,6 +746,8 @@ func extractTime(cp compiledPattern, name string) (time.Time, bool) {
 	var tm time.Time
 	var err error
 	switch len(joined) {
+	case 8:
+		tm, err = time.ParseInLocation("20060102", joined, time.Local)
 	case 10:
 		tm, err = time.ParseInLocation("2006010215", joined, time.Local)
 	case 12:
@@ -460,19 +775,40 @@ func expandAlternates(pattern string) []string {
 	return out
 }
 
-func splitPathPattern(full string) (string, string) {
-	idx := strings.LastIndex(full, "/")
-	if b := strings.LastIndex(full, `\`); b > idx {
-		idx = b
+func splitPathPattern(pattern string) (baseDir, dirPattern, filePattern string) {
+	pattern = filepath.Clean(pattern)
+	filePattern = filepath.Base(pattern)
+	dir := filepath.Dir(pattern)
+	parts := strings.Split(filepath.ToSlash(dir), "/")
+	idx := len(parts)
+
+	for i, p := range parts {
+		if strings.Contains(p, "%") ||
+			strings.Contains(p, "${") ||
+			strings.Contains(p, "*") ||
+			strings.Contains(p, "?") {
+			idx = i
+			break
+		}
 	}
-	if idx < 0 {
-		return ".", full
+
+	if idx == len(parts) {
+		baseDir = dir
+		dirPattern = ""
+	} else {
+		baseDir = filepath.FromSlash(strings.Join(parts[:idx], "/"))
+		dirPattern = filepath.FromSlash(strings.Join(parts[idx:], "/"))
 	}
-	return full[:idx], full[idx+1:]
+
+	if baseDir == "" {
+		baseDir = string(filepath.Separator)
+	}
+
+	return
 }
 
 func patternDir(full string) string {
-	dir, _ := splitPathPattern(full)
+	dir, _, _ := splitPathPattern(full)
 	return dir
 }
 

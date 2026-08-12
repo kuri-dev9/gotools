@@ -1,7 +1,7 @@
 # =========================
 # Config
 # =========================
-BINS := gcurl gtree gwatch
+BINS := gcurl gtree gnode gnicstat gwatch gvault gxfer
 
 GOOS ?= linux
 GOARCH ?= amd64
@@ -57,8 +57,20 @@ gcurl:
 gtree:
 		$(call build_bin,gtree)
 
+gnode:
+		$(call build_bin,gnode)
+
+gnicstat:
+		$(call build_bin,gnicstat)
+
 gwatch:
 		$(call build_bin,gwatch)
 
+gvault:
+		$(call build_bin,gvault)
+
+gxfer:
+		$(call build_bin,gxfer)
+
 clean:
-		rm -rf bin/*
+		rm -rf bin/g*

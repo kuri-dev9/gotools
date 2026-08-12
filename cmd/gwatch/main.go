@@ -64,32 +64,30 @@ func main() {
 }
 
 func printReport(report *filewatch.Report, all bool) {
-	for configIndex, cfg := range report.Configs {
-		if configIndex > 0 {
-			fmt.Println()
-		}
-		fmt.Println(cfg.Name)
-		fmt.Println()
-
-		if cfg.Error != "" {
-			fmt.Println(colorProblem("`-- ERROR: " + cfg.Error))
+	printed := 0
+	for _, cfg := range report.Configs {
+		if cfg.Error == "" && len(cfg.Entries) == 0 {
 			continue
 		}
-		if len(cfg.Entries) == 0 {
-			fmt.Println(colorProblem("`-- no watch patterns"))
+		if printed > 0 {
+			fmt.Println()
+		}
+		printed++
+		fmt.Println(cfg.Path)
+		// fmt.Println()
+
+		if cfg.Error != "" {
+			fmt.Println(colorProblem("└─ ERROR: " + cfg.Error))
 			continue
 		}
 
 		for entryIndex, entry := range cfg.Entries {
 			lastEntry := entryIndex == len(cfg.Entries)-1
 			fmt.Printf("%s %s : %s\n", branch(lastEntry), entry.Label, entry.Dir)
-			filePrefix := "|   "
-			if lastEntry {
-				filePrefix = "    "
-			}
+			filePrefix := branchPrefix(lastEntry)
 
 			if entry.Error != "" {
-				fmt.Println(filePrefix + colorProblem("`-- "+entry.Error))
+				fmt.Println(filePrefix + colorProblem("└─ "+entry.Error))
 				continue
 			}
 			for fileIndex, f := range entry.Files {
@@ -109,16 +107,23 @@ func printReport(report *filewatch.Report, all bool) {
 
 func branch(last bool) string {
 	if last {
-		return "`--"
+		return "└─"
 	}
-	return "|--"
+	return "├─"
 }
 
 func leaf(last bool) string {
 	if last {
-		return "`-- "
+		return "└─ "
 	}
-	return "|-- "
+	return "├─ "
+}
+
+func branchPrefix(last bool) string {
+	if last {
+		return "   "
+	}
+	return "├  "
 }
 
 func colorProblem(s string) string {
