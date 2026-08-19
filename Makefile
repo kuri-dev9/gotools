@@ -1,7 +1,7 @@
 # =========================
 # Config
 # =========================
-BINS := gcurl gtree gnode gnicstat gwatch gvault gxfer
+BINS := gcurl gtree gnode gnicstat gwatch gvault gxfer gkafka
 
 GOOS ?= linux
 GOARCH ?= amd64
@@ -71,6 +71,9 @@ gvault:
 
 gxfer:
 		$(call build_bin,gxfer)
+
+gkafka:
+		$(call build_bin,gkafka)
 
 clean:
 		rm -rf bin/g*
