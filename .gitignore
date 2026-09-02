@@ -37,6 +37,7 @@ config.*.json
 *.csr
 *.tgz
 *.bat
+!WindowMakefile.bat
 
 # Editor / OS files
 .DS_Store
