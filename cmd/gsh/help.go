@@ -16,7 +16,8 @@ Options:
   -V, --version            Show version
 
 Host keys are verified using gsh's private ~/.gsh/known_hosts file.
-Changed host keys require confirmation before the stored key is replaced.
+New host keys are trusted automatically on first use. Changed host keys
+require confirmation before the stored key is replaced.
 
 Examples:
   gsh user@192.168.1.10

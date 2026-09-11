@@ -68,16 +68,11 @@ func knownHostsCallback(config Config) (ssh.HostKeyCallback, error) {
 			}
 			return nil
 		}
-		fmt.Fprintf(config.Stderr, "The authenticity of host %s cannot be established.\n%s key fingerprint is %s.\nContinue connecting (yes/no)? ", hostToken, key.Type(), ssh.FingerprintSHA256(key))
-		answer, err := readAnswer(config.Stdin)
-		if err != nil {
-			return fmt.Errorf("read host key confirmation: %v", err)
-		}
-		if strings.ToLower(strings.TrimSpace(answer)) != "yes" {
-			return fmt.Errorf("host key was not accepted")
-		}
 		if err := appendKnownHost(path, hostToken, key); err != nil {
 			return fmt.Errorf("save host key: %v", err)
+		}
+		if config.Verbose {
+			fmt.Fprintf(config.Stderr, "gsh: trusted and saved new %s host key %s for %s\n", key.Type(), ssh.FingerprintSHA256(key), hostToken)
 		}
 		return nil
 	}, nil

@@ -33,10 +33,12 @@ reports `Permission denied (password)`.
 
 Host key checking is mandatory. `gsh` reads and writes only its private
 `~/.gsh/known_hosts` file; it never reads or modifies the system OpenSSH
-`~/.ssh/known_hosts` file. A first connection displays the SHA-256
-fingerprint and asks `Continue connecting (yes/no)?`, which is compatible with
-the existing Expect pattern. The `~/.gsh` directory is restricted to mode 0700
-and the known-hosts file to mode 0600.
+`~/.ssh/known_hosts` file. On the first connection to a host, gsh automatically
+trusts and saves the key without prompting. This trust-on-first-use policy makes
+unattended initial connections possible, but it cannot detect an attacker who
+intercepts that first connection. Use `-v` to display the key type and SHA-256
+fingerprint saved on first use. The `~/.gsh` directory is restricted to mode
+0700 and the known-hosts file to mode 0600.
 
 If a known host presents a different key, `gsh` displays a warning and the new
 fingerprint, then asks for `yes/no` confirmation again. Rejecting the key leaves
@@ -90,7 +92,7 @@ Suggested manual checks:
 
 Verify password and private-key authentication, an
 `ecdsa-sha2-nistp256`-only server, Ctrl+C, resize, logout, forced disconnect
-terminal restoration, remote exit status, first-use acceptance, mismatch
+terminal restoration, remote exit status, automatic first-use storage, mismatch
 rejection without file changes, and mismatch acceptance with replacement.
 Confirm that `~/.ssh/known_hosts` remains unchanged in every case and that
 `~/.gsh` and `~/.gsh/known_hosts` use modes 0700 and 0600. Also compare remote
