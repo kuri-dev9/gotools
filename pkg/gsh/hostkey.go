@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -19,10 +20,18 @@ func knownHostsCallback(config Config) (ssh.HostKeyCallback, error) {
 	if err != nil {
 		return nil, err
 	}
-	path := filepath.Join(home, ".ssh", "known_hosts")
+	path := filepath.Join(home, ".gsh", "known_hosts")
 	entries, err := readKnownHosts(path)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
+	}
+	if err == nil {
+		if err := os.Chmod(filepath.Dir(path), 0700); err != nil {
+			return nil, err
+		}
+		if err := os.Chmod(path, 0600); err != nil {
+			return nil, err
+		}
 	}
 	hostToken := config.Host
 	if config.Port != 22 {
@@ -44,7 +53,20 @@ func knownHostsCallback(config Config) (ssh.HostKeyCallback, error) {
 			}
 		}
 		if matchedHost {
-			return fmt.Errorf("host key mismatch for %s (received %s %s)", hostToken, key.Type(), ssh.FingerprintSHA256(key))
+			fmt.Fprintf(config.Stderr, "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED for %s!\n", hostToken)
+			fmt.Fprintf(config.Stderr, "The new %s key fingerprint is %s.\n", key.Type(), ssh.FingerprintSHA256(key))
+			fmt.Fprint(config.Stderr, "Are you sure you want to continue connecting (yes/no)? ")
+			answer, err := readAnswer(config.Stdin)
+			if err != nil {
+				return fmt.Errorf("read host key confirmation: %v", err)
+			}
+			if strings.ToLower(strings.TrimSpace(answer)) != "yes" {
+				return fmt.Errorf("host key was not accepted")
+			}
+			if err := replaceKnownHost(path, hostToken, key); err != nil {
+				return fmt.Errorf("replace host key: %v", err)
+			}
+			return nil
 		}
 		fmt.Fprintf(config.Stderr, "The authenticity of host %s cannot be established.\n%s key fingerprint is %s.\nContinue connecting (yes/no)? ", hostToken, key.Type(), ssh.FingerprintSHA256(key))
 		answer, err := readAnswer(config.Stdin)
@@ -110,14 +132,145 @@ func readAnswer(reader io.Reader) (string, error) {
 }
 
 func appendKnownHost(path, host string, key ssh.PublicKey) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+	if err := ensureKnownHostsDirectory(path); err != nil {
 		return err
 	}
-	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_APPEND, 0600)
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	_, err = fmt.Fprintf(file, "%s %s", host, ssh.MarshalAuthorizedKey(key))
-	return err
+	if err := file.Chmod(0600); err != nil {
+		file.Close()
+		return err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		file.Close()
+		return err
+	}
+	if info.Size() > 0 {
+		last := make([]byte, 1)
+		if _, err := file.ReadAt(last, info.Size()-1); err != nil {
+			file.Close()
+			return err
+		}
+		if last[0] != '\n' {
+			if _, err := file.Write([]byte("\n")); err != nil {
+				file.Close()
+				return err
+			}
+		}
+	}
+	if _, err := fmt.Fprintf(file, "%s %s", host, ssh.MarshalAuthorizedKey(key)); err != nil {
+		file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+func ensureKnownHostsDirectory(path string) error {
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0700); err != nil {
+		return err
+	}
+	return os.Chmod(directory, 0700)
+}
+
+func replaceKnownHost(path, host string, key ssh.PublicKey) error {
+	if err := ensureKnownHostsDirectory(path); err != nil {
+		return err
+	}
+	contents, err := ioutil.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+
+	var output bytes.Buffer
+	for len(contents) > 0 {
+		line := contents
+		if index := bytes.IndexByte(contents, '\n'); index >= 0 {
+			line = contents[:index+1]
+			contents = contents[index+1:]
+		} else {
+			contents = nil
+		}
+		output.Write(removeHostFromLine(line, host))
+	}
+	if output.Len() > 0 {
+		current := output.Bytes()
+		if current[len(current)-1] != '\n' {
+			output.WriteByte('\n')
+		}
+	}
+	fmt.Fprintf(&output, "%s %s", host, ssh.MarshalAuthorizedKey(key))
+
+	temporary, err := ioutil.TempFile(filepath.Dir(path), ".known_hosts-")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	keepTemporary := true
+	defer func() {
+		if keepTemporary {
+			os.Remove(temporaryPath)
+		}
+	}()
+	if err := temporary.Chmod(0600); err != nil {
+		temporary.Close()
+		return err
+	}
+	if _, err := temporary.Write(output.Bytes()); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Sync(); err != nil {
+		temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return err
+	}
+	keepTemporary = false
+	return nil
+}
+
+func removeHostFromLine(line []byte, host string) []byte {
+	ending := ""
+	body := line
+	if len(body) > 0 && body[len(body)-1] == '\n' {
+		ending = "\n"
+		body = body[:len(body)-1]
+		if len(body) > 0 && body[len(body)-1] == '\r' {
+			ending = "\r\n"
+			body = body[:len(body)-1]
+		}
+	}
+	fields := strings.Fields(string(body))
+	if len(fields) < 3 || strings.HasPrefix(fields[0], "#") ||
+		strings.HasPrefix(fields[0], "|") || strings.HasPrefix(fields[0], "@") {
+		return line
+	}
+	if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(strings.Join(fields[1:], " "))); err != nil {
+		return line
+	}
+	hosts := strings.Split(fields[0], ",")
+	remaining := hosts[:0]
+	found := false
+	for _, candidate := range hosts {
+		if candidate == host {
+			found = true
+			continue
+		}
+		remaining = append(remaining, candidate)
+	}
+	if !found {
+		return line
+	}
+	if len(remaining) == 0 {
+		return nil
+	}
+	return []byte(strings.Join(remaining, ",") + " " + strings.Join(fields[1:], " ") + ending)
 }

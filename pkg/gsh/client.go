@@ -35,7 +35,7 @@ func (e *ExitError) Error() string {
 
 // Run connects and starts either an interactive shell or a remote command.
 func Run(config Config, command string) (int, error) {
-	authMethods, err := authenticationMethods(config)
+	authMethods, passwordState, err := authenticationMethods(config)
 	if err != nil {
 		return 1, err
 	}
@@ -55,7 +55,10 @@ func Run(config Config, command string) (int, error) {
 	}
 	client, err := ssh.Dial("tcp", address, clientConfig)
 	if err != nil {
-		return 1, classifyConnectError(err)
+		if config.Verbose {
+			fmt.Fprintf(config.Stderr, "gsh: SSH connection detail: %v\n", err)
+		}
+		return 1, classifyConnectError(config, passwordState, err)
 	}
 	defer client.Close()
 
@@ -94,20 +97,24 @@ func waitStatus(err error) (int, error) {
 	return 1, fmt.Errorf("remote session failed: %v", err)
 }
 
-func classifyConnectError(err error) error {
+func classifyConnectError(config Config, passwordState *passwordAuthState, err error) error {
 	text := strings.ToLower(err.Error())
 	switch {
 	case strings.Contains(text, "unable to authenticate"):
-		return fmt.Errorf("authentication failed: %v", err)
+		if passwordState != nil && passwordState.attempts > 0 {
+			return fmt.Errorf("%s@%s: Permission denied (password).", config.User, config.Host)
+		}
+		return fmt.Errorf("%s@%s: Permission denied.", config.User, config.Host)
 	case strings.Contains(text, "no common algorithm") || strings.Contains(text, "no common algo"):
-		return fmt.Errorf("no matching SSH algorithm: %v", err)
+		return fmt.Errorf("no matching SSH algorithm")
 	case strings.Contains(text, "host key"):
-		return fmt.Errorf("host key verification failed: %v", err)
+		detail := strings.TrimPrefix(err.Error(), "ssh: handshake failed: ")
+		return fmt.Errorf("host key verification failed: %s", detail)
 	case strings.Contains(text, "connection refused"):
-		return fmt.Errorf("connection refused: %v", err)
+		return fmt.Errorf("connect to %s:%d: Connection refused", config.Host, config.Port)
 	case strings.Contains(text, "timeout") || strings.Contains(text, "deadline exceeded"):
-		return fmt.Errorf("connection timeout: %v", err)
+		return fmt.Errorf("connect to %s:%d: Connection timed out", config.Host, config.Port)
 	default:
-		return fmt.Errorf("SSH connection failed: %v", err)
+		return fmt.Errorf("SSH connection to %s:%d failed", config.Host, config.Port)
 	}
 }

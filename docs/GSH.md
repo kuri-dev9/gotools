@@ -19,27 +19,38 @@ allocate a PTY, whether or not `-t` is present. A local terminal (including an
 Expect pseudo-terminal) is required when PTY allocation is used. Repeated `-t`
 does not have OpenSSH `-tt` semantics.
 
-Password authentication is prompted as `user@host's Password:` without echo.
+Password authentication is prompted as `user@host's password:` without echo.
 The prompt intentionally matches the Expect pattern `*?assword:*`. Unencrypted
 private keys and passphrase-protected key formats supported by the vendored SSH
 package are accepted. Neither passwords nor private key contents are logged.
 Password and key-passphrase input reuse the repository's shared
-`pkg/auth.ReadPassword` terminal helper.
+`pkg/auth.ReadPassword` terminal helper. Password authentication allows up to
+three attempts in one SSH handshake. Before the second and third prompts it
+prints `Permission denied, please try again.`; after the third failure it
+reports `Permission denied (password)`.
 
 ## Host key policy
 
-Host key checking is mandatory. `gsh` reads and appends plain, exact host
-entries in `~/.ssh/known_hosts`. A first connection displays the SHA-256
+Host key checking is mandatory. `gsh` reads and writes only its private
+`~/.gsh/known_hosts` file; it never reads or modifies the system OpenSSH
+`~/.ssh/known_hosts` file. A first connection displays the SHA-256
 fingerprint and asks `Continue connecting (yes/no)?`, which is compatible with
-the existing Expect pattern. An accepted key is appended with mode 0600; a
-different known key is rejected.
+the existing Expect pattern. The `~/.gsh` directory is restricted to mode 0700
+and the known-hosts file to mode 0600.
 
-This first implementation intentionally does not implement the complete
+If a known host presents a different key, `gsh` displays a warning and the new
+fingerprint, then asks for `yes/no` confirmation again. Rejecting the key leaves
+the existing file unchanged. Accepting it atomically replaces only that host's
+entries; other hosts, comments, and unsupported lines remain intact. For a
+comma-separated host list, only the matching host token is removed.
+
+The implementation intentionally does not implement the complete
 OpenSSH known_hosts grammar. Hashed hosts, wildcard/negated patterns, markers,
 host certificates, revoked-key directives, aliases, and canonical-name/IP
-cross-checks are ignored. If an existing file contains only a hashed entry for
-a host, `gsh` treats that host as unknown and appends a plain entry after user
-confirmation.
+cross-checks are ignored. Host identity uses the exact destination supplied to
+`gsh`; non-default ports use `[host]:port`. If the gsh file contains only a
+hashed entry for a host, `gsh` treats that host as unknown and appends a plain
+entry after user confirmation.
 
 The vendored SSH source declares `ssh.KeyAlgoECDSA256` as
 `ecdsa-sha2-nistp256` and includes it in the default host-key algorithms, so no
@@ -79,8 +90,11 @@ Suggested manual checks:
 
 Verify password and private-key authentication, an
 `ecdsa-sha2-nistp256`-only server, Ctrl+C, resize, logout, forced disconnect
-terminal restoration, remote exit status, first-use acceptance, and mismatch
-rejection. Also compare remote commands with and without `-t`, including
+terminal restoration, remote exit status, first-use acceptance, mismatch
+rejection without file changes, and mismatch acceptance with replacement.
+Confirm that `~/.ssh/known_hosts` remains unchanged in every case and that
+`~/.gsh` and `~/.gsh/known_hosts` use modes 0700 and 0600. Also compare remote
+commands with and without `-t`, including
 initial terminal size and resize forwarding. For Expect, replace only
 `spawn ssh $user@$host` with
 `spawn gsh $user@$host`, then verify password login, the user shell, `sudo -i`,

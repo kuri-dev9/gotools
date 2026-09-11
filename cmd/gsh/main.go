@@ -15,7 +15,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
-const version_info = "1.1.0"
+const version_info = "1.2.0"
 
 func init() {
 	runtime.GOMAXPROCS(1)

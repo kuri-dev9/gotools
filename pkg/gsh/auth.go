@@ -9,24 +9,34 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-func authenticationMethods(config Config) ([]ssh.AuthMethod, error) {
+type passwordAuthState struct {
+	attempts int
+}
+
+func authenticationMethods(config Config) ([]ssh.AuthMethod, *passwordAuthState, error) {
 	methods := make([]ssh.AuthMethod, 0, 2)
 	if config.IdentityFile != "" {
 		signer, err := readPrivateKey(config)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		methods = append(methods, ssh.PublicKeys(signer))
 	}
-	methods = append(methods, ssh.PasswordCallback(func() (string, error) {
-		password, err := readSecret(fmt.Sprintf("%s@%s's Password: ", config.User, config.Host))
+	state := &passwordAuthState{}
+	passwordMethod := ssh.PasswordCallback(func() (string, error) {
+		if state.attempts > 0 {
+			fmt.Fprintln(config.Stderr, "Permission denied, please try again.")
+		}
+		state.attempts++
+		password, err := readSecret(fmt.Sprintf("%s@%s's password: ", config.User, config.Host))
 		if err != nil {
 			return "", err
 		}
 		defer clearBytes(password)
 		return string(password), nil
-	}))
-	return methods, nil
+	})
+	methods = append(methods, ssh.RetryableAuthMethod(passwordMethod, 3))
+	return methods, state, nil
 }
 
 func readPrivateKey(config Config) (ssh.Signer, error) {
